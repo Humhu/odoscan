@@ -244,16 +244,27 @@ private:
 		ProcessCloud( reg, boost::make_shared<LaserCloudType>( *msg ) );
 	}
 
-	bool ResetKeyframe( CloudRegistration& reg )
+	bool ResetKeyframe( CloudRegistration& reg, const LaserCloudType::Ptr& cloud,
+	                    const ros::Time& time )
 	{
-		if( !reg.lastCloud ) { return false; }
-		reg.keyframeCloud = reg.lastCloud;
-		reg.keyframeTime = reg.lastCloudTime;
+		bool hasBackup;
+		if( !reg.lastCloud )
+		{
+			reg.keyframeCloud = cloud;
+			reg.keyframeTime = time;
+			hasBackup = false;
+		}
+		else
+		{
+			reg.keyframeCloud = reg.lastCloud;
+			reg.keyframeTime = reg.lastCloudTime;
+			hasBackup = true;
+		}
 		reg.lastPose = PoseSE3();
-		reg.lastPoseTime = reg.lastCloudTime;
+		reg.lastPoseTime = reg.keyframeTime;
 		reg.lastCloud = nullptr;
 		reg.lastCloudTime = ros::Time();
-		return true;
+		return hasBackup;
 	}
 
 	void PredictMotion( CloudRegistration& reg,
@@ -301,14 +312,18 @@ private:
 	}
 
 	void RetryCloud( CloudRegistration& reg,
-	                 const LaserCloudType::Ptr& cloud )
+	                 const LaserCloudType::Ptr& cloud,
+	                 ros::Time& time,
+	                 WriteLock& lock )
 	{
-		if( !ResetKeyframe( reg ) )
+		if( !ResetKeyframe( reg, cloud, time ) )
 		{
 			ROS_WARN_STREAM( "No backup keyframe available. Cannot retry!" );
 		}
 		else
 		{
+			ROS_INFO_STREAM( "Reprocessing with backup keyframe" );
+			lock.unlock();
 			ProcessCloud( reg, cloud );
 		}
 	}
@@ -341,32 +356,31 @@ private:
 		// Synchronize registration access
 		WriteLock lock( reg.mutex );
 
-		double keyframeAge = (currTime - reg.keyframeTime).toSec();
-		double dt = (currTime - reg.lastPoseTime).toSec();
-
 		// Initialization sets the first keyframe
 		if( !reg.keyframeCloud )
 		{
-			reg.lastCloud = cloud;
-			reg.lastCloudTime = currTime;
-			ResetKeyframe( reg );
+			ROS_INFO_STREAM( "Initializing keyframe..." );
+			ResetKeyframe( reg, currCloud, currTime );
 			return;
 		}
 
+		double dt = (currTime - reg.lastPoseTime).toSec();
 		if( dt < 0 || dt > _maxDt )
 		{
-			ROS_WARN_STREAM( "Negative or large dt detected. Resetting..." );
+			ROS_WARN_STREAM( "Negative or large dt " << dt << " detected. Resetting..." );
 			_velIntegrator.Reset();
 			// Set system to state needing reinitialization
-			reg.keyframeCloud = nullptr;
+			ResetKeyframe( reg, currCloud, currTime );
 			return;
 		}
 
+		double keyframeAge = (currTime - reg.keyframeTime).toSec();
 		// If the keyframe expired, set it to the last cloud and call process again
 		if( keyframeAge > _maxKeyframeAge )
 		{
 			ROS_INFO_STREAM( "Keyframe expired. Retrying with backup keyframe..." );
-			RetryCloud( reg, cloud );
+			RetryCloud( reg, currCloud, currTime, lock );
+			return;
 		}
 
 		LaserCloudType::Ptr aligned = boost::make_shared<LaserCloudType>();
@@ -395,14 +409,15 @@ private:
 		if( !result.success )
 		{
 			ROS_WARN_STREAM( "Scan matching failed! Retrying with backup keyframe..." );
-			RetryCloud( reg, cloud );
+			RetryCloud( reg, currCloud, currTime, lock );
+			return;
 		}
 
 
 		if( _checker.HasDegeneracy( result.inliers ) )
 		{
 			// NOTE Don't retry for degeneracy
-			ResetKeyframe( reg );
+			ResetKeyframe( reg, currCloud, currTime );
 			return;
 		}
 
@@ -413,14 +428,16 @@ private:
 			                 " inliers out of " << reg.keyframeCloud->size() <<
 			                 " input points, less than min ratio " << _minInlierRatio <<
 			                 " or number " << _minNumInliers << ". Retrying with backup keyframe..." );
-			RetryCloud( reg, cloud );
+			RetryCloud( reg, currCloud, currTime, lock );
+			return;
 		}
 
 		if( result.fitness > _maxError )
 		{
 			ROS_WARN_STREAM( "Scan match result has error " << result.fitness << " greater than threshold " << _maxError <<
 			                 " Retrying with backup keyframe..." );
-		RetryCloud( reg, cloud );
+			RetryCloud( reg, currCloud, currTime, lock );
+			return;
 		}
 
 		// TODO Logic for 2D flip case
@@ -437,7 +454,7 @@ private:
 		// Update
 		reg.lastPose = result.transform;
 		reg.lastPoseTime = currTime;
-		reg.lastCloud = cloud;
+		reg.lastCloud = currCloud;
 		reg.lastCloudTime = currTime;
 	}
 };
