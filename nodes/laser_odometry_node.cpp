@@ -109,7 +109,7 @@ public:
 		_minInlierRatio.AddCheck<LessThanOrEqual>( 1.0 );
 
 		_minNumInliers.InitializeAndRead( ph, 50, "min_num_inliers",
-						  "Minimum number of inliers required" );
+		                                  "Minimum number of inliers required" );
 	}
 
 private:
@@ -135,7 +135,7 @@ private:
 
 	NumericParam _maxError;
 	NumericParam _minInlierRatio;
-  NumericParam _minNumInliers;
+	NumericParam _minNumInliers;
 
 	struct CloudRegistration
 	{
@@ -152,6 +152,8 @@ private:
 
 		LaserCloudType::Ptr keyframeCloud;
 		ros::Time keyframeTime;
+		LaserCloudType::Ptr lastCloud;
+		ros::Time lastCloudTime;
 		PoseSE3 lastPose;
 		ros::Time lastPoseTime;
 	};
@@ -239,17 +241,19 @@ private:
 	void CloudCallback( CloudRegistration& reg,
 	                    const LaserCloudType::ConstPtr& msg )
 	{
-		ProcessCloud( reg, msg );
+		ProcessCloud( reg, boost::make_shared<LaserCloudType>( *msg ) );
 	}
 
-	void ResetKeyframe( CloudRegistration& reg,
-	                    const LaserCloudType::Ptr& cloud,
-	                    const ros::Time& time )
+	bool ResetKeyframe( CloudRegistration& reg )
 	{
-		reg.keyframeCloud = cloud;
-		reg.keyframeTime = time;
+		if( !reg.lastCloud ) { return false; }
+		reg.keyframeCloud = reg.lastCloud;
+		reg.keyframeTime = reg.lastCloudTime;
 		reg.lastPose = PoseSE3();
-		reg.lastPoseTime = time;
+		reg.lastPoseTime = reg.lastCloudTime;
+		reg.lastCloud = nullptr;
+		reg.lastCloudTime = ros::Time();
+		return true;
 	}
 
 	void PredictMotion( CloudRegistration& reg,
@@ -296,8 +300,21 @@ private:
 		}
 	}
 
+	void RetryCloud( CloudRegistration& reg,
+	                 const LaserCloudType::Ptr& cloud )
+	{
+		if( !ResetKeyframe( reg ) )
+		{
+			ROS_WARN_STREAM( "No backup keyframe available. Cannot retry!" );
+		}
+		else
+		{
+			ProcessCloud( reg, cloud );
+		}
+	}
+
 	void ProcessCloud( CloudRegistration& reg,
-	                   const LaserCloudType::ConstPtr& cloud )
+	                   const LaserCloudType::Ptr& cloud )
 	{
 		// Parse message fields
 		LaserCloudType::Ptr currCloud;
@@ -308,7 +325,7 @@ private:
 		}
 		else
 		{
-			currCloud = boost::make_shared<LaserCloudType>( *cloud );
+			currCloud = cloud;
 		}
 
 		ros::Time currTime;
@@ -326,17 +343,30 @@ private:
 
 		double keyframeAge = (currTime - reg.keyframeTime).toSec();
 		double dt = (currTime - reg.lastPoseTime).toSec();
-		if( dt < 0 )
+
+		// Initialization sets the first keyframe
+		if( !reg.keyframeCloud )
 		{
-			ROS_WARN_STREAM( "Negative dt detected. Resetting..." );
-			_velIntegrator.Reset();
-			ResetKeyframe( reg, currCloud, currTime );
+			reg.lastCloud = cloud;
+			reg.lastCloudTime = currTime;
+			ResetKeyframe( reg );
 			return;
 		}
-		if( !reg.keyframeCloud || dt > _maxDt || keyframeAge > _maxKeyframeAge )
+
+		if( dt < 0 || dt > _maxDt )
 		{
-			ResetKeyframe( reg, currCloud, currTime );
+			ROS_WARN_STREAM( "Negative or large dt detected. Resetting..." );
+			_velIntegrator.Reset();
+			// Set system to state needing reinitialization
+			reg.keyframeCloud = nullptr;
 			return;
+		}
+
+		// If the keyframe expired, set it to the last cloud and call process again
+		if( keyframeAge > _maxKeyframeAge )
+		{
+			ROS_INFO_STREAM( "Keyframe expired. Retrying with backup keyframe..." );
+			RetryCloud( reg, cloud );
 		}
 
 		LaserCloudType::Ptr aligned = boost::make_shared<LaserCloudType>();
@@ -353,8 +383,8 @@ private:
 		{
 			if( result.success && aligned )
 			{
-			  //result.inliers->header = aligned->header;
-			        reg.debugAlignedPub.publish( aligned );
+				//result.inliers->header = aligned->header;
+				reg.debugAlignedPub.publish( aligned );
 			}
 			if( reg.keyframeCloud )
 			{
@@ -364,15 +394,15 @@ private:
 
 		if( !result.success )
 		{
-			ROS_WARN_STREAM( "Scan matching failed! Resetting keyframe..." );
-			ResetKeyframe( reg, currCloud, currTime );
-			return;
+			ROS_WARN_STREAM( "Scan matching failed! Retrying with backup keyframe..." );
+			RetryCloud( reg, cloud );
 		}
 
 
 		if( _checker.HasDegeneracy( result.inliers ) )
 		{
-			ResetKeyframe( reg, currCloud, currTime );
+			// NOTE Don't retry for degeneracy
+			ResetKeyframe( reg );
 			return;
 		}
 
@@ -382,16 +412,15 @@ private:
 			ROS_WARN_STREAM( "Found " << result.inliers->size() <<
 			                 " inliers out of " << reg.keyframeCloud->size() <<
 			                 " input points, less than min ratio " << _minInlierRatio <<
-					 " or number " << _minNumInliers );
-			ResetKeyframe( reg, currCloud, currTime );
-			return;
+			                 " or number " << _minNumInliers << ". Retrying with backup keyframe..." );
+			RetryCloud( reg, cloud );
 		}
 
 		if( result.fitness > _maxError )
 		{
-			ROS_WARN_STREAM( "Scan match result has error " << result.fitness << " greater than threshold " << _maxError );
-			ResetKeyframe( reg, currCloud, currTime );
-			return;
+			ROS_WARN_STREAM( "Scan match result has error " << result.fitness << " greater than threshold " << _maxError <<
+			                 " Retrying with backup keyframe..." );
+		RetryCloud( reg, cloud );
 		}
 
 		// TODO Logic for 2D flip case
@@ -408,6 +437,8 @@ private:
 		// Update
 		reg.lastPose = result.transform;
 		reg.lastPoseTime = currTime;
+		reg.lastCloud = cloud;
+		reg.lastCloudTime = currTime;
 	}
 };
 
