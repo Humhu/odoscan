@@ -144,6 +144,7 @@ private:
 		laser_geometry::LaserProjection projector;
 		ros::Subscriber cloudSub;
 		ros::Publisher velPub;
+		ros::Publisher dispPub;
 
 		bool overrideTimestamp;
 		bool showOutput;
@@ -184,8 +185,10 @@ private:
 		}
 
 		std::string outputTopic;
-		GetParamRequired( info, "output_topic", outputTopic );
+		GetParamRequired( info, "output_topic", outputTopic ); // TODO Make this pose_topic
 		reg.velPub = _nh.advertise<geometry_msgs::TwistStamped>( outputTopic, 0 );
+		GetParamRequired( info, "displacement_topic", outputTopic );		
+		reg.dispPub = _nh.advertise<geometry_msgs::PoseStamped>( outputTopic, 0 );
 
 		unsigned int buffSize;
 		std::string inputTopic;
@@ -450,6 +453,12 @@ private:
 		out.header.frame_id = cloud->header.frame_id;
 		out.twist = TangentToMsg( laserVelocity );
 		reg.velPub.publish( out );
+
+		geometry_msgs::PoseStamped pOut;
+		pOut.header.stamp = currTime;
+		pOut.header.frame_id = cloud->header.frame_id;
+		pOut.pose = PoseToMsg( displacement );
+		reg.dispPub.publish( pOut );
 
 		// Update
 		reg.lastPose = result.transform;
